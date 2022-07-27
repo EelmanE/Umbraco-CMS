@@ -41,7 +41,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
         // We must keep separate dictionaries for by id and by alias because we track these in snapshot/layers
         // and it is possible that the alias of a content type can be different for the same id in another layer
         // whereas the GUID -> INT cross reference can never be different
-        private readonly ConcurrentDictionary<int, LinkedNode<IPublishedContentType>> _contentTypesById;       
+        private readonly ConcurrentDictionary<int, LinkedNode<IPublishedContentType>> _contentTypesById;
         private readonly ConcurrentDictionary<string, LinkedNode<IPublishedContentType>> _contentTypesByAlias;
         private readonly ConcurrentDictionary<Guid, int> _contentTypeKeyToIdMap;
         private readonly ConcurrentDictionary<Guid, int> _contentKeyToIdMap;
@@ -598,7 +598,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
                 throw new ArgumentException("Kit content cannot have children.", nameof(kit));
             // ReSharper restore LocalizableElement
 
-            _logger.Debug<ContentStore,int>("Set content ID: {KitNodeId}", kit.Node.Id);
+            _logger.Debug<ContentStore, int>("Set content ID: {KitNodeId}", kit.Node.Id);
 
             // get existing
             _contentNodes.TryGetValue(kit.Node.Id, out var link);
@@ -675,7 +675,36 @@ namespace Umbraco.Web.PublishedCache.NuCache
         /// <exception cref="InvalidOperationException">
         /// Thrown if this method is not called within a write lock
         /// </exception>
+        [Obsolete("Use the overload that takes a 'kitGroupSize' parameter instead")]
         public bool SetAllFastSortedLocked(IEnumerable<ContentNodeKit> kits, bool fromDb)
+        {
+            return SetAllFastSortedLocked(kits, 1, fromDb);
+        }
+
+        /// <summary>
+        /// Builds all kits on startup using a fast forward only cursor
+        /// </summary>
+        /// <param name="kits">
+        /// All kits sorted by Level + Parent Id + Sort order
+        /// </param>
+        /// <param name="kitGroupSize"></param>
+        /// <param name="fromDb">True if the data is coming from the database (not the local cache db)</param>
+        /// <returns></returns>
+        /// <remarks>
+        /// <para>
+        /// This requires that the collection is sorted by Level + ParentId + Sort Order.
+        /// This should be used only on a site startup as the first generations.
+        /// This CANNOT be used after startup since it bypasses all checks for Generations.
+        /// </para>
+        /// <para>
+        /// This methods MUST be called from within a write lock, normally wrapped within GetScopedWriteLock
+        /// otherwise an exception will occur.
+        /// </para>
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown if this method is not called within a write lock
+        /// </exception>
+        public bool SetAllFastSortedLocked(IEnumerable<ContentNodeKit> kits, int kitGroupSize, bool fromDb)
         {
             EnsureLocked();
 
@@ -693,52 +722,64 @@ namespace Umbraco.Web.PublishedCache.NuCache
             ContentNode previousNode = null;
             ContentNode parent = null;
 
-            foreach (var kit in kits)
+            // By using InGroupsOf() here we are forcing the database query result extraction to retrieve items in batches,
+            // reducing the possibility of a database timeout (ThreadAbortException) on large datasets.
+            // This in turn reduces the possibility that the NuCache file will remain locked, because an exception
+            // here results in the calling method to not release the lock.
+
+            // However the larger the batck size, the more content loaded into memory.  So by default, this is set to 1 and can be increased by setting
+            // the configuration setting Umbraco.Web.PublishedCache.NuCache.PublishedSnapshotService.StaticKitBatchSize to a higher value.
+
+            // If we are not loading from the database, then we can ignore this restriction.
+
+            foreach (var kitGroup in kits.InGroupsOf(!fromDb || kitGroupSize < 1 ? 1 : kitGroupSize))
             {
-                if (!BuildKit(kit, out var parentLink))
+                foreach (var kit in kitGroup)
                 {
-                    ok = false;
-                    continue; // skip that one
+                    if (!BuildKit(kit, out var parentLink))
+                    {
+                        ok = false;
+                        continue; // skip that one
+                    }
+
+                    var thisNode = kit.Node;
+
+                    if (parent == null)
+                    {
+                        // first parent
+                        parent = parentLink.Value;
+                        parent.FirstChildContentId = thisNode.Id; // this node is the first node
+                    }
+                    else if (parent.Id != parentLink.Value.Id)
+                    {
+                        // new parent
+                        parent = parentLink.Value;
+                        parent.FirstChildContentId = thisNode.Id; // this node is the first node
+                        previousNode = null; // there is no previous sibling
+                    }
+
+                    _logger.Debug<ContentStore>("Set {Id} with parent {ParentContentId}", thisNode.Id, thisNode.ParentContentId);
+                    SetValueLocked(_contentNodes, thisNode.Id, thisNode);
+
+                    // if we are initializing from the database source ensure the local db is updated
+                    if (fromDb && _localDb != null) RegisterChange(thisNode.Id, kit);
+
+                    // this node is always the last child
+                    parent.LastChildContentId = thisNode.Id;
+
+                    // wire previous node as previous sibling
+                    if (previousNode != null)
+                    {
+                        previousNode.NextSiblingContentId = thisNode.Id;
+                        thisNode.PreviousSiblingContentId = previousNode.Id;
+                    }
+
+                    // this node becomes the previous node
+                    previousNode = thisNode;
+
+                    _contentKeyToIdMap[kit.Node.Uid] = kit.Node.Id;
                 }
-
-                var thisNode = kit.Node;
-
-                if (parent == null)
-                {
-                    // first parent
-                    parent = parentLink.Value;
-                    parent.FirstChildContentId = thisNode.Id; // this node is the first node
-                }
-                else if (parent.Id != parentLink.Value.Id)
-                {
-                    // new parent
-                    parent = parentLink.Value;
-                    parent.FirstChildContentId = thisNode.Id; // this node is the first node
-                    previousNode = null; // there is no previous sibling
-                }
-
-                _logger.Debug<ContentStore>("Set {Id} with parent {ParentContentId}", thisNode.Id, thisNode.ParentContentId);
-                SetValueLocked(_contentNodes, thisNode.Id, thisNode);
-
-                // if we are initializing from the database source ensure the local db is updated
-                if (fromDb && _localDb != null) RegisterChange(thisNode.Id, kit);
-
-                // this node is always the last child
-                parent.LastChildContentId = thisNode.Id;
-
-                // wire previous node as previous sibling
-                if (previousNode != null)
-                {
-                    previousNode.NextSiblingContentId = thisNode.Id;
-                    thisNode.PreviousSiblingContentId = previousNode.Id;
-                }
-
-                // this node becomes the previous node
-                previousNode = thisNode;
-
-                _contentKeyToIdMap[kit.Node.Uid] = kit.Node.Id;
             }
-
             return ok;
         }
 
@@ -754,7 +795,27 @@ namespace Umbraco.Web.PublishedCache.NuCache
         /// <exception cref="InvalidOperationException">
         /// Thrown if this method is not called within a write lock
         /// </exception>
+        [Obsolete("Use the overload that takes the 'kitGroupSize' and 'fromDb' parameters instead")]
         public bool SetAllLocked(IEnumerable<ContentNodeKit> kits)
+        {
+            return SetAllLocked(kits, 1, false);
+        }
+
+        /// <summary>
+        /// Set all data for a collection of <see cref="ContentNodeKit"/>
+        /// </summary>
+        /// <param name="kits"></param>
+        /// <param name="kitGroupSize"></param>
+        /// <param name="fromDb">True if the data is coming from the database (not the local cache db)</param>
+        /// <returns></returns>
+        /// <remarks>
+        /// This methods MUST be called from within a write lock, normally wrapped within GetScopedWriteLock
+        /// otherwise an exception will occur.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown if this method is not called within a write lock
+        /// </exception>
+        public bool SetAllLocked(IEnumerable<ContentNodeKit> kits, int kitGroupSize, bool fromDb)
         {
             EnsureLocked();
 
@@ -767,20 +828,32 @@ namespace Umbraco.Web.PublishedCache.NuCache
             //ClearLocked(_contentTypesById);
             //ClearLocked(_contentTypesByAlias);
 
-            foreach (var kit in kits)
+            // By using InGroupsOf() here we are forcing the database query result extraction to retrieve items in batches,
+            // reducing the possibility of a database timeout (ThreadAbortException) on large datasets.
+            // This in turn reduces the possibility that the NuCache file will remain locked, because an exception
+            // here results in the calling method to not release the lock.
+
+            // However the larger the batck size, the more content loaded into memory.  So by default, this is set to 1 and can be increased by setting
+            // the configuration setting Umbraco.Web.PublishedCache.NuCache.PublishedSnapshotService.StaticKitBatchSize to a higher value.
+
+            // If we are not loading from the database, then we can ignore this restriction.
+            foreach (var kitGroup in kits.InGroupsOf(!fromDb || kitGroupSize < 1 ? 1 : kitGroupSize))
             {
-                if (!BuildKit(kit, out var parent))
+                foreach (var kit in kitGroup)
                 {
-                    ok = false;
-                    continue; // skip that one
+                    if (!BuildKit(kit, out var parent))
+                    {
+                        ok = false;
+                        continue; // skip that one
+                    }
+                    _logger.Debug<ContentStore>($"Set {kit.Node.Id} with parent {kit.Node.ParentContentId}");
+                    SetValueLocked(_contentNodes, kit.Node.Id, kit.Node);
+
+                    if (_localDb != null) RegisterChange(kit.Node.Id, kit);
+                    AddTreeNodeLocked(kit.Node, parent);
+
+                    _contentKeyToIdMap[kit.Node.Uid] = kit.Node.Id;
                 }
-                _logger.Debug<ContentStore>($"Set {kit.Node.Id} with parent {kit.Node.ParentContentId}");
-                SetValueLocked(_contentNodes, kit.Node.Id, kit.Node);
-
-                if (_localDb != null) RegisterChange(kit.Node.Id, kit);
-                AddTreeNodeLocked(kit.Node, parent);
-
-                _contentKeyToIdMap[kit.Node.Uid] = kit.Node.Id;
             }
 
             return ok;
@@ -863,7 +936,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
             if (link?.Value == null) return false;
 
             var content = link.Value;
-            _logger.Debug<ContentStore,int>("Clear content ID: {ContentId}", content.Id);
+            _logger.Debug<ContentStore, int>("Clear content ID: {ContentId}", content.Id);
 
             // clear the entire branch
             ClearBranchLocked(content);

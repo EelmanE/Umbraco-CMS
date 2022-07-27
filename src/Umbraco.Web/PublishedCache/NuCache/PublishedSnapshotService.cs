@@ -51,6 +51,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
         private readonly UrlSegmentProviderCollection _urlSegmentProviders;
         private readonly IContentCacheDataSerializerFactory _contentCacheDataSerializerFactory;
         private readonly ContentDataSerializer _contentDataSerializer;
+        private readonly int _kitBatchSize;
 
         private bool _isReady;
         private bool _isReadSet;
@@ -140,6 +141,8 @@ namespace Umbraco.Web.PublishedCache.NuCache
                 idkMap.SetMapper(UmbracoObjectTypes.Document, id => GetUid(_contentStore, id), uid => GetId(_contentStore, uid));
                 idkMap.SetMapper(UmbracoObjectTypes.Media, id => GetUid(_mediaStore, id), uid => GetId(_mediaStore, uid));
             }
+
+            _kitBatchSize = GetKitBatchSize();
         }
 
         private int GetId(ContentStore store, Guid uid)
@@ -154,6 +157,12 @@ namespace Umbraco.Web.PublishedCache.NuCache
             return store.LiveSnapshot.Get(id)?.Uid ?? default;
         }
 
+        private const int DefaultKitBatchSize = 1;
+        private static int GetKitBatchSize()
+        {
+            var appSetting = ConfigurationManager.AppSettings["Umbraco.Web.PublishedCache.NuCache.PublishedSnapshotService.StaticKitBatchSize"];
+            return appSetting != null && int.TryParse(appSetting, out var size) ? size : DefaultKitBatchSize;
+        }
         /// <summary>
         /// Install phase of <see cref="IMainDom"/>
         /// </summary>
@@ -402,8 +411,18 @@ namespace Umbraco.Web.PublishedCache.NuCache
                 _localContentDb?.Clear();
 
                 // IMPORTANT GetAllContentSources sorts kits by level + parentId + sortOrder
-                var kits = _dataSource.GetAllContentSources(scope);
-                return onStartup ? _contentStore.SetAllFastSortedLocked(kits, true) : _contentStore.SetAllLocked(kits);
+                try
+                {
+                    var kits = _dataSource.GetAllContentSources(scope);
+                    return onStartup ? _contentStore.SetAllFastSortedLocked(kits, _kitBatchSize, true) : _contentStore.SetAllLocked(kits, _kitBatchSize, true);
+                }
+                catch (ThreadAbortException tae)
+                {
+                    // Caught a ThreadAbortException, most likely from a database timeout.
+                    // If we don't catch it here, the whole local cache can remain locked causing widespread panic (see above comment).
+                    _logger.Warn<PublishedSnapshotService>(tae, tae.Message);
+                }
+                return false;
             }
         }
 
@@ -474,8 +493,19 @@ namespace Umbraco.Web.PublishedCache.NuCache
 
                 _logger.Debug<PublishedSnapshotService>("Loading media from database...");
                 // IMPORTANT GetAllMediaSources sorts kits by level + parentId + sortOrder
-                var kits = _dataSource.GetAllMediaSources(scope);
-                return onStartup ? _mediaStore.SetAllFastSortedLocked(kits, true) : _mediaStore.SetAllLocked(kits);
+                try
+                {
+
+                    var kits = _dataSource.GetAllMediaSources(scope);
+                    return onStartup ? _mediaStore.SetAllFastSortedLocked(kits, _kitBatchSize, true) : _mediaStore.SetAllLocked(kits, _kitBatchSize, true);
+                }
+                catch (ThreadAbortException tae)
+                {
+                    // Caught a ThreadAbortException, most likely from a database timeout.
+                    // If we don't catch it here, the whole local cache can remain locked causing widespread panic (see above comment).
+                    _logger.Warn<PublishedSnapshotService>(tae, tae.Message);
+                }
+                return false;
             }
         }
 
@@ -524,7 +554,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
                 return false;
             }
 
-            return onStartup ? store.SetAllFastSortedLocked(kits, false) : store.SetAllLocked(kits);
+            return onStartup ? store.SetAllFastSortedLocked(kits, _kitBatchSize, false) : store.SetAllLocked(kits, _kitBatchSize, false);
         }
 
         // keep these around - might be useful
@@ -672,7 +702,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
 
             foreach (var payload in payloads)
             {
-                _logger.Debug<PublishedSnapshotService,TreeChangeTypes,int>("Notified {ChangeTypes} for content {ContentId}", payload.ChangeTypes, payload.Id);
+                _logger.Debug<PublishedSnapshotService, TreeChangeTypes, int>("Notified {ChangeTypes} for content {ContentId}", payload.ChangeTypes, payload.Id);
 
                 if (payload.ChangeTypes.HasType(TreeChangeTypes.RefreshAll))
                 {
@@ -759,7 +789,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
 
             foreach (var payload in payloads)
             {
-                _logger.Debug<PublishedSnapshotService,TreeChangeTypes,int>("Notified {ChangeTypes} for media {MediaId}", payload.ChangeTypes, payload.Id);
+                _logger.Debug<PublishedSnapshotService, TreeChangeTypes, int>("Notified {ChangeTypes} for media {MediaId}", payload.ChangeTypes, payload.Id);
 
                 if (payload.ChangeTypes.HasType(TreeChangeTypes.RefreshAll))
                 {
@@ -828,7 +858,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
             EnsureCaches();
 
             foreach (var payload in payloads)
-                _logger.Debug<PublishedSnapshotService, ContentTypeChangeTypes, string,int>("Notified {ChangeTypes} for {ItemType} {ItemId}", payload.ChangeTypes, payload.ItemType, payload.Id);
+                _logger.Debug<PublishedSnapshotService, ContentTypeChangeTypes, string, int>("Notified {ChangeTypes} for {ItemType} {ItemId}", payload.ChangeTypes, payload.ItemType, payload.Id);
 
             Notify<IContentType>(_contentStore, payloads, RefreshContentTypesLocked);
             Notify<IMediaType>(_mediaStore, payloads, RefreshMediaTypesLocked);
@@ -910,7 +940,7 @@ namespace Umbraco.Web.PublishedCache.NuCache
             var idsA = payloads.Select(x => x.Id).ToArray();
 
             foreach (var payload in payloads)
-                _logger.Debug<PublishedSnapshotService, string,int>("Notified {RemovedStatus} for data type {DataTypeId}",
+                _logger.Debug<PublishedSnapshotService, string, int>("Notified {RemovedStatus} for data type {DataTypeId}",
                     payload.Removed ? "Removed" : "Refreshed",
                     payload.Id);
 
